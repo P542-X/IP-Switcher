@@ -4,6 +4,8 @@ const fs = require('fs');
 const os = require('os');
 const zlib = require('zlib');
 const dns = require('dns');
+const net = require('net');
+const dgram = require('dgram');
 const { exec } = require('child_process');
 
 const DEV_URL = process.env.ELECTRON_START_URL || 'http://localhost:3000';
@@ -1163,6 +1165,301 @@ async function resolveHostnamesWindows(ips) {
   return (data && typeof data === 'object') ? data : {};
 }
 
+// ─── IDENTIFICACIÓN DE EQUIPOS ──────────────────────────────────────────────
+// Un puerto abierto es evidencia directa de qué hay al otro lado: el 102 es
+// S7comm (Siemens), el 502 Modbus, el 44818 EtherNet/IP... Se sondea solo
+// dentro del rango que el usuario ha pedido escanear y solo sobre los equipos
+// que ya han respondido, con conexiones TCP (sin procesos) y timeout corto.
+const SERVICE_PROBES = [
+  // ── Industrial / PLC
+  { port: 102,   name: 'S7comm',       role: 'plc',     detail: 'Siemens S7 / ISO-TSAP' },
+  { port: 502,   name: 'Modbus TCP',   role: 'plc' },
+  { port: 44818, name: 'EtherNet/IP',  role: 'plc',     detail: 'Allen-Bradley / Omron' },
+  { port: 48898, name: 'TwinCAT ADS',  role: 'plc',     detail: 'Beckhoff' },
+  { port: 2455,  name: 'CODESYS',      role: 'plc',     detail: 'WAGO / soft-PLC' },
+  { port: 1962,  name: 'PCWorx',       role: 'plc',     detail: 'Phoenix Contact' },
+  { port: 9600,  name: 'FINS',         role: 'plc',     detail: 'Omron' },
+  { port: 5007,  name: 'MELSEC',       role: 'plc',     detail: 'Mitsubishi' },
+  { port: 20000, name: 'DNP3',         role: 'plc' },
+  { port: 4840,  name: 'OPC UA',       role: 'scada' },
+  // ── HMI / visualización
+  { port: 5900,  name: 'VNC',          role: 'hmi' },
+  // ── Gestión de equipos de red
+  { port: 22,    name: 'SSH',          role: 'mgmt' },
+  { port: 23,    name: 'Telnet',       role: 'mgmt' },
+  // ── Web
+  { port: 80,    name: 'HTTP',         role: 'web' },
+  { port: 443,   name: 'HTTPS',        role: 'web' },
+  { port: 8080,  name: 'HTTP alt',     role: 'web' },
+  // ── Impresión
+  { port: 9100,  name: 'RAW/JetDirect', role: 'printer' },
+  { port: 631,   name: 'IPP',          role: 'printer' },
+  { port: 515,   name: 'LPD',          role: 'printer' },
+  // ── Equipos de escritorio y almacenamiento
+  { port: 445,   name: 'SMB',          role: 'host' },
+  { port: 3389,  name: 'RDP',          role: 'host' },
+  { port: 548,   name: 'AFP',          role: 'nas' },
+  { port: 2049,  name: 'NFS',          role: 'nas' },
+];
+
+const PROBE_CONCURRENCY = 64;
+const PROBE_TIMEOUT = 700;
+
+// Conexión TCP cruda: ni procesos ni PowerShell, así que se pueden lanzar
+// muchas a la vez sin el problema que tenía el barrido de ping.
+function tcpProbe(ip, port, timeout = PROBE_TIMEOUT) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (open) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(open);
+    };
+    socket.setTimeout(timeout);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    try { socket.connect(port, ip); } catch { finish(false); }
+  });
+}
+
+// ─── SNMP v2c mínimo (solo GET) ─────────────────────────────────────────────
+// sysDescr es, con diferencia, lo que mejor identifica un switch gestionado,
+// un AP o una impresora: lo dice el propio equipo.
+const OID_SYS_DESCR = '1.3.6.1.2.1.1.1.0';
+const OID_SYS_OBJECT = '1.3.6.1.2.1.1.2.0';
+const OID_SYS_NAME = '1.3.6.1.2.1.1.5.0';
+
+function berLength(len) {
+  if (len < 0x80) return Buffer.from([len]);
+  const bytes = [];
+  let n = len;
+  while (n > 0) { bytes.unshift(n & 0xFF); n >>>= 8; }
+  return Buffer.from([0x80 | bytes.length, ...bytes]);
+}
+function berTlv(tag, value) {
+  return Buffer.concat([Buffer.from([tag]), berLength(value.length), value]);
+}
+function berInteger(n) {
+  const bytes = [];
+  let v = n;
+  do { bytes.unshift(v & 0xFF); v >>= 8; } while (v > 0 && v !== -1);
+  if (bytes[0] & 0x80) bytes.unshift(0); // siempre positivo
+  return berTlv(0x02, Buffer.from(bytes));
+}
+function berOid(oid) {
+  const parts = oid.split('.').map(Number);
+  const out = [parts[0] * 40 + parts[1]];
+  for (const part of parts.slice(2)) {
+    if (part < 0x80) { out.push(part); continue; }
+    const chunks = [];
+    let v = part;
+    while (v > 0) { chunks.unshift(v & 0x7F); v >>>= 7; }
+    for (let i = 0; i < chunks.length - 1; i++) chunks[i] |= 0x80;
+    out.push(...chunks);
+  }
+  return berTlv(0x06, Buffer.from(out));
+}
+
+function snmpBuildGet(oids, community, requestId) {
+  const varbinds = oids.map(o => berTlv(0x30, Buffer.concat([berOid(o), berTlv(0x05, Buffer.alloc(0))])));
+  const pdu = berTlv(0xA0, Buffer.concat([
+    berInteger(requestId),
+    berInteger(0), // error-status
+    berInteger(0), // error-index
+    berTlv(0x30, Buffer.concat(varbinds)),
+  ]));
+  return berTlv(0x30, Buffer.concat([
+    berInteger(1), // version 1 == SNMPv2c
+    berTlv(0x04, Buffer.from(community, 'ascii')),
+    pdu,
+  ]));
+}
+
+// Parser BER mínimo: devuelve { tag, value, end } del TLV que empieza en pos.
+function berRead(buf, pos) {
+  if (pos + 2 > buf.length) return null;
+  const tag = buf[pos];
+  let len = buf[pos + 1];
+  let valueStart = pos + 2;
+  if (len & 0x80) {
+    const n = len & 0x7F;
+    if (n === 0 || n > 4 || valueStart + n > buf.length) return null;
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | buf[valueStart + i];
+    valueStart += n;
+  }
+  const end = valueStart + len;
+  if (end > buf.length) return null;
+  return { tag, value: buf.slice(valueStart, end), end };
+}
+function berDecodeOid(buf) {
+  if (buf.length === 0) return '';
+  const out = [Math.floor(buf[0] / 40), buf[0] % 40];
+  let acc = 0;
+  for (let i = 1; i < buf.length; i++) {
+    acc = (acc << 7) | (buf[i] & 0x7F);
+    if (!(buf[i] & 0x80)) { out.push(acc); acc = 0; }
+  }
+  return out.join('.');
+}
+
+function snmpParseResponse(buf) {
+  const seq = berRead(buf, 0);
+  if (!seq || seq.tag !== 0x30) return null;
+  const body = seq.value;
+  const version = berRead(body, 0);
+  if (!version) return null;
+  const community = berRead(body, version.end);
+  if (!community) return null;
+  const pdu = berRead(body, community.end);
+  if (!pdu || pdu.tag !== 0xA2) return null;   // GetResponse
+  const p = pdu.value;
+  const reqId = berRead(p, 0);
+  if (!reqId) return null;
+  const errStatus = berRead(p, reqId.end);
+  if (!errStatus) return null;
+  const errIndex = berRead(p, errStatus.end);
+  if (!errIndex) return null;
+  const vbList = berRead(p, errIndex.end);
+  if (!vbList || vbList.tag !== 0x30) return null;
+
+  const result = {};
+  let pos = 0;
+  while (pos < vbList.value.length) {
+    const vb = berRead(vbList.value, pos);
+    if (!vb) break;
+    pos = vb.end;
+    const oidTlv = berRead(vb.value, 0);
+    if (!oidTlv || oidTlv.tag !== 0x06) continue;
+    const valTlv = berRead(vb.value, oidTlv.end);
+    if (!valTlv) continue;
+    const oid = berDecodeOid(oidTlv.value);
+    if (valTlv.tag === 0x04) result[oid] = valTlv.value.toString('utf8').replace(/\0+$/, '').trim();
+    else if (valTlv.tag === 0x06) result[oid] = berDecodeOid(valTlv.value);
+    else if (valTlv.tag === 0x02 || valTlv.tag === 0x41 || valTlv.tag === 0x43) {
+      let n = 0;
+      for (const b of valTlv.value) n = (n * 256) + b;
+      result[oid] = String(n);
+    }
+  }
+  return { requestId: reqId.value, errorStatus: errStatus.value[0] || 0, varbinds: result };
+}
+
+// Devuelve { sysDescr, sysName } o null si el equipo no habla SNMP.
+function snmpGet(ip, community = 'public', timeout = 1200) {
+  return new Promise((resolve) => {
+    let socket;
+    try { socket = dgram.createSocket('udp4'); } catch { return resolve(null); }
+    const requestId = Math.floor(Math.random() * 0x7FFFFFFF);
+    const packet = snmpBuildGet([OID_SYS_DESCR, OID_SYS_NAME, OID_SYS_OBJECT], community, requestId);
+
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch {}
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeout);
+
+    socket.once('error', () => finish(null));
+    socket.on('message', (msg) => {
+      const parsed = snmpParseResponse(msg);
+      if (!parsed || parsed.errorStatus !== 0) return finish(null);
+      const vb = parsed.varbinds;
+      finish({
+        sysDescr: vb[OID_SYS_DESCR] || null,
+        sysName: vb[OID_SYS_NAME] || null,
+        sysObjectId: vb[OID_SYS_OBJECT] || null,
+      });
+    });
+
+    try { socket.send(packet, 161, ip, (err) => { if (err) finish(null); }); }
+    catch { finish(null); }
+  });
+}
+
+// ─── Clasificación ──────────────────────────────────────────────────────────
+// El orden importa: lo más específico primero. El tipo siempre va acompañado
+// de la evidencia (puertos abiertos) para que se pueda contrastar.
+function classifyDevice({ openPorts, isGateway, snmp }) {
+  const has = (p) => openPorts.includes(p);
+  const services = SERVICE_PROBES.filter(s => openPorts.includes(s.port));
+  const roles = new Set(services.map(s => s.role));
+  const descr = (snmp?.sysDescr || '').toLowerCase();
+
+  let type = null;
+  let detail = null;
+
+  if (roles.has('plc')) {
+    type = 'PLC';
+    detail = services.filter(s => s.role === 'plc').map(s => s.detail || s.name).join(' · ');
+  } else if (roles.has('scada')) {
+    type = 'SCADA / OPC UA';
+  } else if (has(5900) && (has(80) || has(443))) {
+    type = 'HMI / panel';
+  } else if (has(9100) || has(631)) {
+    // El 515 (LPD) solo no vale: lo abren bastantes equipos que no imprimen
+    // (las TV LG webOS, por ejemplo, salían clasificadas como impresora).
+    type = 'Impresora';
+  } else if (descr) {
+    // Lo que diga el propio equipo por SNMP manda sobre la heurística
+    if (/switch/.test(descr)) type = 'Switch gestionado';
+    else if (/router|gateway|firewall/.test(descr)) type = 'Router / firewall';
+    else if (/access ?point|wireless|wi-?fi/.test(descr)) type = 'Punto de acceso';
+    else if (/printer|laserjet|officejet/.test(descr)) type = 'Impresora';
+    else if (/plc|simatic|controller/.test(descr)) type = 'PLC';
+    else type = 'Equipo SNMP';
+    detail = snmp.sysDescr.split(/[,\n]/)[0].slice(0, 60);
+  } else if (isGateway) {
+    type = 'Router';
+  } else if (has(23) && roles.has('web')) {
+    // Telnet + web es mucho más propio de un switch o un AP que de un PC
+    type = 'Equipo de red';
+  } else if (has(22)) {
+    // SSH + web es idéntico en un switch gestionado y en un Linux cualquiera:
+    // por TCP no se pueden distinguir, así que no se inventa. Para que un
+    // switch se identifique de verdad hay que habilitarle SNMP de lectura.
+    type = 'Servidor / SSH';
+  } else if (has(3389) || has(445)) {
+    type = 'PC';
+  } else if (roles.has('nas')) {
+    type = 'NAS';
+  } else if (roles.has('web')) {
+    type = 'Dispositivo web';
+  }
+
+  return {
+    type,
+    typeDetail: detail || null,
+    services: services.map(s => `${s.port}/${s.name}`),
+    openPorts,
+    sysDescr: snmp?.sysDescr || null,
+    sysName: snmp?.sysName || null,
+  };
+}
+
+// Sondea un equipo entero: puertos + SNMP en paralelo.
+async function fingerprintDevice(ip, { isGateway = false, shouldAbort } = {}) {
+  const [openPorts, snmp] = await Promise.all([
+    (async () => {
+      const results = await mapPool(
+        SERVICE_PROBES,
+        PROBE_CONCURRENCY,
+        async (probe) => ((await tcpProbe(ip, probe.port)) ? probe.port : null),
+        shouldAbort
+      );
+      return results.filter(p => p != null);
+    })(),
+    snmpGet(ip),
+  ]);
+  return classifyDevice({ openPorts, isGateway, snmp });
+}
+
 // ─── WATCHER (monitor de equipos esperados por perfil) ──────────────────────
 let watchTimer = null;
 let watchProfile = null;           // perfil activo que estamos vigilando
@@ -1299,6 +1596,7 @@ async function scanNetwork(req, webContents) {
 
   const baseIp = typeof req === 'string' ? req : req?.baseIp;
   const prefixReq = (req && typeof req === 'object') ? req.prefix : null;
+  const gatewayIp = (req && typeof req === 'object' && isValidIp(req.gateway)) ? req.gateway : null;
 
   if (!isValidIp(baseIp)) {
     if (webContents && !webContents.isDestroyed()) webContents.send('scan-complete', { success: false, error: 'IP base inválida' });
@@ -1387,16 +1685,30 @@ async function scanNetwork(req, webContents) {
 
   send('scan-complete', { success: true, count: [...seen.values()].filter(e => e.alive).length });
 
-  // Los que siguen sin nombre, en una sola llamada a PowerShell, ya con el
-  // barrido dado por terminado: los nombres van llegando después.
+  // FASE 5 — identificación de equipos y nombres NetBIOS, ya con el barrido
+  // dado por terminado: tipos y nombres van llegando y la lista se rellena
+  // sola, sin que el usuario espere mirando la barra de progreso.
   const unnamed = [...seen.values()].filter(e => e.alive && !e.hostname).map(e => e.ip);
-  if (unnamed.length > 0 && !aborted()) {
-    const names = await resolveHostnamesWindows(unnamed);
-    for (const [ip, name] of Object.entries(names)) {
+  await Promise.all([
+    (async () => {
+      if (unnamed.length === 0 || aborted()) return;
+      const names = await resolveHostnamesWindows(unnamed);
+      for (const [ip, name] of Object.entries(names)) {
+        const entry = seen.get(ip);
+        if (entry && name && !entry.hostname) { entry.hostname = String(name); emitUpd(entry); }
+      }
+    })(),
+    mapPool(aliveIps, 8, async (ip) => {
+      const fp = await fingerprintDevice(ip, { isGateway: ip === gatewayIp, shouldAbort: aborted });
       const entry = seen.get(ip);
-      if (entry && name && !entry.hostname) { entry.hostname = String(name); emitUpd(entry); }
-    }
-  }
+      if (!entry) return;
+      Object.assign(entry, fp);
+      // sysName de SNMP vale como nombre si el DNS no dio ninguno
+      if (!entry.hostname && fp.sysName) entry.hostname = fp.sysName;
+      emitUpd(entry);
+    }, aborted),
+  ]);
+
   finish();
 }
 

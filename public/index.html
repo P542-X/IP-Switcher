@@ -753,6 +753,16 @@
     .scan-row .scan-mac.empty { color: var(--text-ghost); }
     .scan-row .scan-vendor { color: var(--text-dim); font-family: var(--font-sans); font-size: 11.5px; }
     .scan-row .scan-hostname { color: var(--text-faint); font-size: 10.5px; margin-top: 2px; }
+    /* Identificación del equipo: tipo deducido de los puertos abiertos */
+    .scan-row .scan-type { color: var(--accent); font-weight: 600; font-family: var(--font-mono); font-size: 10.5px; }
+    .scan-row .scan-type.plc { color: var(--warning); }
+    .scan-row .scan-vendor-sub { color: var(--text-faint); font-size: 10.5px; }
+    .scan-row .scan-detail {
+      color: var(--text-faint); font-family: var(--font-sans); font-size: 10.5px; margin-top: 2px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+    }
+    .scan-row .scan-services { color: var(--text-ghost); font-size: 9.5px; margin-top: 3px; letter-spacing: 0.04em; }
+    .scan-row .scan-info { min-width: 0; }
     .scan-row .scan-tags { display: flex; gap: 6px; align-items: center; }
     .scan-tag {
       font-family: var(--font-mono); font-size: 9px; font-weight: 600;

@@ -664,10 +664,13 @@ export default function App() {
       if (selectedAdapterInfo?.ip && isValidIp(selectedAdapterInfo.ip)) return selectedAdapterInfo.ip;
       return "192.168.1.1";
     };
-    return { base: pick(), prefix };
+    const gw = ipConfig?.gateway && isValidIp(ipConfig.gateway)
+      ? ipConfig.gateway
+      : (selectedAdapterInfo?.gateway || null);
+    return { base: pick(), prefix, gateway: gw };
   }, [form.gateway, ipConfig, selectedAdapterInfo]);
 
-  const startScan = useCallback(async (base, prefix) => {
+  const startScan = useCallback(async (base, prefix, gateway) => {
     if (!isElectron || !isValidIp(base)) return;
     // Cancelar antes de relanzar: al pulsar "Re-escanear" el barrido anterior
     // seguía vivo lanzando pings y los dos se estorbaban, de ahí que saliera
@@ -679,7 +682,7 @@ export default function App() {
     setScanStatus("running");
     setScanError(null);
     try {
-      await window.electronAPI.scanNetwork({ baseIp: base, prefix });
+      await window.electronAPI.scanNetwork({ baseIp: base, prefix, gateway: gateway || null });
     } catch (err) {
       setScanStatus("error");
       setScanError(err.message);
@@ -688,7 +691,7 @@ export default function App() {
 
   const openScan = (preferred) => {
     if (!isElectron) { showToast("Solo disponible en la app", false); return; }
-    const { base, prefix } = inferScanBase(preferred);
+    const { base, prefix, gateway } = inferScanBase(preferred);
     setScanBaseIp(base);
     setScanPrefix(prefix);
     setScanDevices([]);
@@ -697,7 +700,7 @@ export default function App() {
     setScanStatus("running");
     setScanError(null);
     setScanOpen(true);
-    startScan(base, prefix);
+    startScan(base, prefix, gateway);
   };
 
   const closeScan = async () => {
@@ -1546,7 +1549,7 @@ export default function App() {
                 {scanStatus === "running" ? (
                   <button className="btn btn-ghost btn-sm" onClick={closeScan}>Cancelar</button>
                 ) : (
-                  <button className="btn btn-ghost btn-sm" onClick={() => startScan(scanBaseIp, scanRange.prefix ?? scanPrefix)}><Icons.Refresh /> Re-escanear</button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => startScan(scanBaseIp, scanRange.prefix ?? scanPrefix, gatewayIp)}><Icons.Refresh /> Re-escanear</button>
                 )}
               </div>
             </div>
@@ -1590,9 +1593,22 @@ export default function App() {
                     <div key={d.ip} className={`scan-row ${d._new ? "new-device" : ""} ${d.alive === false ? "dead" : ""}`}>
                       <span className={`scan-ip ${isGateway ? "gateway" : ""} ${isSelf ? "self" : ""}`}>{d.ip}</span>
                       <span className={`scan-mac ${d.mac ? "" : "empty"}`}>{d.mac || "—"}</span>
-                      <span>
-                        <div className="scan-vendor">{d.vendor || (d.mac ? "Desconocido" : "…")}</div>
+                      <span className="scan-info">
+                        <div className="scan-vendor">
+                          {d.type
+                            ? <span className={`scan-type ${d.type.startsWith("PLC") ? "plc" : ""}`}>{d.type}</span>
+                            : (d.vendor || (d.mac ? "Desconocido" : "…"))}
+                          {d.type && d.vendor && <span className="scan-vendor-sub"> · {d.vendor}</span>}
+                        </div>
                         {d.hostname && <div className="scan-hostname">{d.hostname}</div>}
+                        {(d.sysDescr || d.typeDetail) && (
+                          <div className="scan-detail" title={d.sysDescr || d.typeDetail}>{d.sysDescr || d.typeDetail}</div>
+                        )}
+                        {d.services?.length > 0 && (
+                          <div className="scan-services" title={`Puertos abiertos: ${d.openPorts.join(", ")}`}>
+                            {d.services.slice(0, 4).join("  ")}{d.services.length > 4 ? `  +${d.services.length - 4}` : ""}
+                          </div>
+                        )}
                       </span>
                       <span className="scan-tags">
                         {isGateway && <span className="scan-tag gateway">GATEWAY</span>}

@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const net = require('net');
 const Module = require('module');
 
 const MAIN = path.join(__dirname, '..', 'electron', 'main.js');
@@ -48,6 +49,9 @@ Module._load = function (request, parent, isMain) {
 };
 
 const EXPORTS = [
+  'berOid', 'berInteger', 'berTlv', 'berRead', 'berDecodeOid', 'snmpBuildGet',
+  'snmpParseResponse', 'snmpGet', 'tcpProbe', 'classifyDevice', 'fingerprintDevice',
+  'SERVICE_PROBES', 'OID_SYS_DESCR', 'OID_SYS_NAME', 'OID_SYS_OBJECT',
   'isValidIp', 'isValidMask', 'ipToInt', 'intToIp', 'maskToPrefix', 'prefixToMask',
   'ipRoleInSubnet', 'sameSubnet', 'mapPool', 'netshTarget', 'cidrHosts',
   'psJson', 'psAsync', 'getAdaptersAsync', 'readIpConfig', 'getIpConfigAsync',
@@ -190,6 +194,86 @@ const ok = (cond, label, extra) => {
   ok(applyBad3.success === false && /DNS/.test(applyBad3.error), 'apply-ip rechaza DNS inválido', applyBad3);
   const applyBad4 = await handlers.get('apply-ip')(null, { ip: '192.168.1.5', mask: '255.255.255.0' });
   ok(applyBad4.success === false, 'apply-ip sin adaptador', applyBad4);
+
+  console.log('\n[11] Codificación BER');
+  // 1.3.6.1.2.1.1.1.0 → 06 08 2b 06 01 02 01 01 01 00  (valor conocido del estándar)
+  ok(T.berOid('1.3.6.1.2.1.1.1.0').toString('hex') === '06082b06010201010100',
+    'OID sysDescr codificado según el estándar', T.berOid('1.3.6.1.2.1.1.1.0').toString('hex'));
+  // sub-identificador > 127 debe ir en base 128: 1745 = 0x8D 0x51
+  ok(T.berOid('1.3.6.1.4.1.9.1.1745').toString('hex').endsWith('8d51'),
+    'sub-identificador grande en base 128', T.berOid('1.3.6.1.4.1.9.1.1745').toString('hex'));
+  ok(T.berInteger(0).toString('hex') === '020100', 'entero 0');
+  ok(T.berInteger(200).toString('hex') === '020200c8', 'entero 200 sin signo', T.berInteger(200).toString('hex'));
+  ok(T.berDecodeOid(T.berOid('1.3.6.1.2.1.1.5.0').slice(2)) === '1.3.6.1.2.1.1.5.0', 'OID ida y vuelta');
+
+  console.log('\n[12] Paquete SNMP GetRequest');
+  const pkt = T.snmpBuildGet([T.OID_SYS_DESCR, T.OID_SYS_NAME], 'public', 12345);
+  const seq = T.berRead(pkt, 0);
+  ok(seq && seq.tag === 0x30, 'empieza por SEQUENCE');
+  const ver = T.berRead(seq.value, 0);
+  ok(ver.value[0] === 1, 'versión 1 (SNMPv2c)', ver.value[0]);
+  const com = T.berRead(seq.value, ver.end);
+  ok(com.value.toString() === 'public', 'comunidad', com.value.toString());
+  const pdu = T.berRead(seq.value, com.end);
+  ok(pdu.tag === 0xA0, 'PDU GetRequest (0xA0)', pdu && pdu.tag.toString(16));
+
+  console.log('\n[13] Parseo de una respuesta');
+  // Se construye un GetResponse válido y se comprueba que el parser lo lee
+  const vb = (oid, str) => T.berTlv(0x30, Buffer.concat([T.berOid(oid), T.berTlv(0x04, Buffer.from(str, 'utf8'))]));
+  const respPdu = T.berTlv(0xA2, Buffer.concat([
+    T.berInteger(12345), T.berInteger(0), T.berInteger(0),
+    T.berTlv(0x30, Buffer.concat([
+      vb(T.OID_SYS_DESCR, 'Cisco IOS Software, C2960 Switch, Version 15.0'),
+      vb(T.OID_SYS_NAME, 'SW-PLANTA-1'),
+    ])),
+  ]));
+  const resp = T.berTlv(0x30, Buffer.concat([T.berInteger(1), T.berTlv(0x04, Buffer.from('public')), respPdu]));
+  const parsed = T.snmpParseResponse(resp);
+  ok(parsed !== null, 'respuesta parseada');
+  ok(parsed?.varbinds[T.OID_SYS_DESCR]?.startsWith('Cisco IOS'), 'sysDescr recuperado', parsed?.varbinds[T.OID_SYS_DESCR]);
+  ok(parsed?.varbinds[T.OID_SYS_NAME] === 'SW-PLANTA-1', 'sysName recuperado', parsed?.varbinds[T.OID_SYS_NAME]);
+  ok(T.snmpParseResponse(Buffer.from([1, 2, 3])) === null, 'basura → null, sin excepción');
+  ok(T.snmpParseResponse(Buffer.alloc(0)) === null, 'vacío → null');
+  // Una respuesta larga obliga a la longitud BER de varios bytes
+  const largo = 'X'.repeat(400);
+  const respLargo = T.berTlv(0x30, Buffer.concat([T.berInteger(1), T.berTlv(0x04, Buffer.from('public')),
+    T.berTlv(0xA2, Buffer.concat([T.berInteger(1), T.berInteger(0), T.berInteger(0),
+      T.berTlv(0x30, vb(T.OID_SYS_DESCR, largo))]))]));
+  ok(T.snmpParseResponse(respLargo)?.varbinds[T.OID_SYS_DESCR]?.length === 400, 'longitud BER larga (>127 bytes)');
+
+  console.log('\n[14] Sondeo TCP');
+  const srv = net.createServer(s => s.end());
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  const puerto = srv.address().port;
+  ok(await T.tcpProbe('127.0.0.1', puerto, 800) === true, `puerto abierto ${puerto} detectado`);
+  srv.close();
+  await new Promise(r => setTimeout(r, 200));
+  ok(await T.tcpProbe('127.0.0.1', puerto, 800) === false, 'puerto cerrado detectado');
+  const t0 = Date.now();
+  ok(await T.tcpProbe('192.0.2.77', 102, 600) === false, 'IP inalcanzable no cuelga');
+  ok(Date.now() - t0 < 2000, 'respeta el timeout', Date.now() - t0);
+
+  console.log('\n[15] Clasificación');
+  const c = (ports, extra = {}) => T.classifyDevice({ openPorts: ports, isGateway: false, snmp: null, ...extra });
+  ok(c([102, 80]).type === 'PLC', 'puerto 102 → PLC', c([102, 80]));
+  ok(c([102]).typeDetail?.includes('Siemens'), 'detalle Siemens en el 102', c([102]).typeDetail);
+  ok(c([502]).type === 'PLC', 'Modbus → PLC');
+  ok(c([44818]).type === 'PLC', 'EtherNet/IP → PLC');
+  ok(c([4840]).type === 'SCADA / OPC UA', 'OPC UA');
+  ok(c([5900, 80]).type === 'HMI / panel', 'VNC + web → HMI');
+  ok(c([9100, 80]).type === 'Impresora', 'JetDirect → impresora');
+  ok(c([80, 443], { isGateway: true }).type === 'Router', 'gateway → router');
+  ok(c([23, 80]).type === 'Equipo de red', 'Telnet + web → equipo de red', c([23,80]));
+  ok(c([22, 80]).type === 'Servidor / SSH', 'SSH + web → servidor, no se inventa switch', c([22,80]));
+  ok(c([515]).type === null, '515 solo (TV LG) ya no es impresora', c([515]));
+  ok(c([9100]).type === 'Impresora', '9100 sí es impresora');
+  ok(c([3389, 445]).type === 'PC', 'RDP/SMB → PC');
+  ok(c([]).type === null, 'sin puertos → sin tipo');
+  const snmpSw = c([23, 80], { snmp: { sysDescr: 'Cisco IOS Software, C2960 Switch' } });
+  ok(snmpSw.type === 'Switch gestionado', 'SNMP manda sobre la heurística', snmpSw);
+  ok(c([102], { snmp: { sysDescr: 'SIMATIC S7-1200' } }).type === 'PLC', 'el protocolo industrial manda sobre SNMP');
+  ok(c([102, 80]).services.join() === '102/S7comm,80/HTTP', 'servicios listados, los industriales primero', c([102, 80]).services);
+
 
   console.log('\n' + (fails === 0 ? 'TODO OK' : fails + ' PRUEBA(S) FALLIDA(S)'));
   process.exit(fails === 0 ? 0 : 1);
